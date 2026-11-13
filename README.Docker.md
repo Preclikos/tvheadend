@@ -308,6 +308,13 @@ docker container run \
     'ghcr.io/tvheadend/tvheadend:issue-123'
 ```
 
+> _Tip_: To offer HTSP encrypted (TLS), for example to clients outside your
+> network, enable it under Configuration > General > Base (or add
+> `--htsp_tls_port 9984` after the image name) and publish that port too
+> (`--publish "0.0.0.0:9984:9984/tcp"`). The self-signed certificate is
+> generated in the configuration volume; its fingerprint is shown on the
+> same page.
+
 
 > _Note_: A proper docker setup isolates container's networking completely with
 > unique interfaces per container. The default `run` command as used throughout

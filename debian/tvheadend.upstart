@@ -26,6 +26,7 @@ script
   [ -z "$TVH_HTTP_PORT" ] || ARGS="$ARGS --http_port $TVH_HTTP_PORT"
   [ -z "$TVH_HTTP_ROOT" ] || ARGS="$ARGS --http_root $TVH_HTTP_ROOT"
   [ -z "$TVH_HTSP_PORT" ] || ARGS="$ARGS --htsp_port $TVH_HTSP_PORT"
+  [ -z "$TVH_HTSP_TLS_PORT" ] || ARGS="$ARGS --htsp_tls_port $TVH_HTSP_TLS_PORT"
   [ "$TVH_DEBUG" = "1"  ] && ARGS="$ARGS -s"
 
   exec tvheadend $ARGS $TVH_ARGS

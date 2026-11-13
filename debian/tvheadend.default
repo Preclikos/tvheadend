@@ -52,6 +52,12 @@ TVH_HTTP_ROOT=""
 #   if set to "" will use binary default
 TVH_HTSP_PORT=""
 
+# TVH_HTSP_TLS_PORT
+#   encrypted (TLS) HTSP port, e.g. 9984; if set to "" the web
+#   configuration (Configuration > General > Base) decides
+#   (init script and upstart only, add --htsp_tls_port to OPTIONS for systemd)
+TVH_HTSP_TLS_PORT=""
+
 # TVH_DEBUG
 #   if set to 1 will output debug to syslog
 TVH_DEBUG=0

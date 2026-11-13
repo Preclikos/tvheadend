@@ -38,6 +38,8 @@ Usage: `tvheadend [OPTIONS]`
       --http_root             Specify alternative http webroot
       --htsp_port             Specify alternative htsp port
       --htsp_port2            Specify extra htsp port
+      --htsp_tls_port         Specify encrypted (TLS) htsp port (standard port is 9984),
+                              overrides the web configuration
       --useragent             Specify User-Agent header for the http client
       --xspf                  Use XSPF playlist instead of M3U
 ```

@@ -93,6 +93,12 @@ Specify alternative HTSP port (default 9982).
 \fB\-\-htsp_port2
 Specify extra HTSP port.
 .TP
+\fB\-\-htsp_tls_port
+Specify the encrypted (TLS) HTSP port (standard port 9984). The port can
+also be enabled in the general configuration; this option overrides it.
+The certificate is set in the general configuration; without one, a
+self-signed certificate is generated in the configuration directory.
+.TP
 \fB\-\-useragent
 Specify User-Agent header for the http client.
 .TP
