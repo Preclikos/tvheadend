@@ -39,18 +39,69 @@ def htsp_digest(user, passwd, chal):
     return hashlib.sha1(salted).digest()
 
 
+# SHA-256 fingerprint of a DER certificate as "AB:CD:..."
+def cert_fingerprint(der):
+    import hashlib
+    return ':'.join('%02X' % b for b in bytearray(hashlib.sha256(der).digest()))
+
+
+def _normalize_fingerprint(fp):
+    return fp.replace(':', '').replace(' ', '').upper()
+
+
 # Client object
 class HTSPClient(object):
     # Setup connection
-    def __init__(self, addr, name='HTSP PyClient'):
+    #
+    # tls:         connect to the encrypted HTSP port
+    # fingerprint: accept only the certificate with this SHA-256
+    #              fingerprint (for a self-signed certificate)
+    # cafile:      verify the certificate against this CA bundle
+    #              (default: the system trust store)
+    #
+    # Without a fingerprint the certificate and the host name are
+    # verified. The fingerprint of the server certificate is available
+    # as the 'fingerprint' attribute.
+    def __init__(self, addr, name='HTSP PyClient', tls=False,
+                 fingerprint=None, cafile=None, timeout=None):
         import socket
 
         # Setup
-        self._sock = socket.create_connection(addr)
+        self._sock = socket.create_connection(addr, timeout)
+        self.fingerprint = None
+        if tls:
+            self._sock = self._wrap_tls(addr[0], fingerprint, cafile)
+        self._rfile = self._sock.makefile('rb')
         self._name = name
         self._auth = None
         self._user = None
         self._pass = None
+
+    def _wrap_tls(self, host, fingerprint, cafile):
+        import ssl
+
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        if fingerprint:
+            # pinned self-signed certificate, checked below
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        elif cafile:
+            ctx.load_verify_locations(cafile)
+        else:
+            ctx.load_default_certs()
+        try:
+            sock = ctx.wrap_socket(self._sock, server_hostname=host)
+        except Exception:
+            self._sock.close()
+            raise
+        self.fingerprint = cert_fingerprint(sock.getpeercert(binary_form=True))
+        if fingerprint and \
+           _normalize_fingerprint(fingerprint) != _normalize_fingerprint(self.fingerprint):
+            sock.close()
+            raise Exception('certificate fingerprint mismatch: %s' % self.fingerprint)
+        log.debug('tls: %s %s' % (sock.version(), sock.cipher()[0]))
+        return sock
 
     # Send
     def send(self, func, args={}):
@@ -59,11 +110,11 @@ class HTSPClient(object):
         if self._pass: args['digest'] = htsmsg.HMFBin(self._pass)
         log.debug('htsp tx:')
         log.debug(args, pretty=True)
-        self._sock.send(htsmsg.serialize(args))
+        self._sock.sendall(htsmsg.serialize(args))
 
     # Receive
     def recv(self):
-        ret = htsmsg.deserialize(self._sock, False)
+        ret = htsmsg.deserialize(self._rfile, False)
         log.debug('htsp rx:')
         log.debug(ret, pretty=True)
         return ret
@@ -99,5 +150,6 @@ class HTSPClient(object):
         self.send('enableAsyncMetadata', args)
 
     def disconnect(self):
+        self._rfile.close()
         self._sock.close()
 

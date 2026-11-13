@@ -46,10 +46,19 @@ try:
                   help='Get async EPG updates')
   optp.add_option('-t', '--update', default=None, type='int',
                   help='Specify when to receive updates from')
+  optp.add_option('-s', '--tls', default=False, action='store_true',
+                  help='Connect to the encrypted (TLS) HTSP port')
+  optp.add_option('-f', '--fingerprint', default=None,
+                  help='Accept only the server certificate with this SHA-256 fingerprint')
+  optp.add_option('-c', '--cafile', default=None,
+                  help='Verify the server certificate against this CA file')
   (opts, args) = optp.parse_args()
 
   # Connect
-  htsp = HTSPClient((opts.host, opts.port))
+  htsp = HTSPClient((opts.host, opts.port), tls=opts.tls,
+                    fingerprint=opts.fingerprint, cafile=opts.cafile)
+  if htsp.fingerprint:
+    log.info('TLS certificate SHA-256 fingerprint %s' % htsp.fingerprint)
   msg  = htsp.hello()
   log.info('connected to %s [%s]' % (msg['servername'], msg['serverversion']))
   log.info('using protocol v%d' % htsp._version)
