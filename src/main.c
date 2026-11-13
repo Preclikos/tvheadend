@@ -150,6 +150,7 @@ int              tvheadend_webui_port;
 int              tvheadend_webui_debug;
 int              tvheadend_htsp_port;
 int              tvheadend_htsp_port_extra;
+int              tvheadend_htsp_tls_port;
 const char      *tvheadend_cwd0;
 const char      *tvheadend_cwd;
 const char      *tvheadend_webroot;
@@ -826,6 +827,7 @@ main(int argc, char **argv)
   tvheadend_webroot         = NULL;
   tvheadend_htsp_port       = 9982;
   tvheadend_htsp_port_extra = 0;
+  tvheadend_htsp_tls_port   = 0;
   __mdispatch_clock = getmonoclock();
   __gdispatch_clock = time(NULL);
 
@@ -933,6 +935,9 @@ main(int argc, char **argv)
       OPT_INT, &tvheadend_htsp_port },
     {   0, "htsp_port2", N_("Specify extra htsp port"),
       OPT_INT, &tvheadend_htsp_port_extra },
+    {   0, "htsp_tls_port", N_("Specify encrypted (TLS) htsp port (standard port is 9984),\n"
+                                "overrides the web configuration"),
+      OPT_INT, &tvheadend_htsp_tls_port },
     {   0, "useragent",  N_("Specify User-Agent header for the http client"),
       OPT_STR, &opt_user_agent },
     {   0, "xspf",       N_("Use XSPF playlist instead of M3U"),

@@ -36,6 +36,7 @@
 #include "url.h"
 #include "http.h"
 #include "satip/server.h"
+#include "htsp_server.h"
 #include "channels.h"
 #include "input/mpegts/scanfile.h"
 
@@ -1824,6 +1825,7 @@ config_boot
   config.local_ip = strdup("");
   config.local_port = 0;
   config.page_size_ui = 50;
+  config.htsp_tls_port = HTSP_TLS_DEFAULT_PORT;
 
   /* Generate default */
   if (!path)
@@ -1971,6 +1973,8 @@ void config_done ( void )
   free(config.date_mask);
   free(config.hdhomerun_ip);
   free(config.local_ip);
+  free(config.htsp_tls_cert);
+  free(config.htsp_tls_key);
   file_unlock(config_lock, config_lock_fd);
 }
 
@@ -2023,6 +2027,48 @@ wrong:
     return 1;
   }
   return 0;
+}
+
+static void
+config_class_changed ( idnode_t *self )
+{
+  /* open, move or close the encrypted HTSP port */
+  htsp_tls_reconfigure();
+}
+
+static const void *
+config_class_htsp_tls_fingerprint_get ( void *o )
+{
+  htsp_tls_fingerprint(prop_sbuf, PROP_SBUF_LEN);
+  prop_sbuf_ptr = prop_sbuf;
+  return &prop_sbuf_ptr;
+}
+
+static const void *
+config_class_htsp_tls_status_get ( void *o )
+{
+  htsp_tls_status(prop_sbuf, PROP_SBUF_LEN);
+  prop_sbuf_ptr = prop_sbuf;
+  return &prop_sbuf_ptr;
+}
+
+/* a TCP port: anything else keeps the previous value */
+static int
+config_class_htsp_tls_port_set ( void *o, const void *v )
+{
+  int port = *(const int *)v;
+
+  if (port < 1 || port > 65535 || port == config.htsp_tls_port)
+    return 0;
+  config.htsp_tls_port = port;
+  return 1;
+}
+
+/* the command line option --htsp_tls_port overrides the configuration */
+static uint32_t
+config_class_htsp_tls_opts ( void *o, uint32_t opts )
+{
+  return htsp_tls_port_locked() ? opts | PO_RDONLY : opts;
 }
 
 static const void *
@@ -2248,6 +2294,7 @@ const idclass_t config_class = {
   .ic_perm_def   = ACCESS_ADMIN,
   .ic_doc        = tvh_doc_config_class,
   .ic_save       = config_class_save,
+  .ic_changed    = config_class_changed,
   .ic_groups     = (const property_group_t[]) {
       {
          .name   = N_("Server Settings"),
@@ -2280,6 +2327,10 @@ const idclass_t config_class = {
       {
          .name   = N_("Miscellaneous Settings"),
          .number = 8,
+      },
+      {
+         .name   = N_("HTSP TLS Settings"),
+         .number = 9,
       },
       {}
   },
@@ -2771,6 +2822,83 @@ const idclass_t config_class = {
       .off    = offsetof(config_t, rtsp_udp_max_port),
       .opts   = PO_EXPERT,
       .group  = 7,
+    },
+    {
+      .type   = PT_BOOL,
+      .id     = "htsp_tls_enabled",
+      .name   = N_("Enable encrypted HTSP port"),
+      .desc   = N_("Accept HTSP connections encrypted with TLS on a "
+                   "separate port. The plain HTSP port keeps working; "
+                   "the client has to support TLS. The change is "
+                   "applied immediately. Read-only when the port is set "
+                   "by the command line option --htsp_tls_port."),
+      .off    = offsetof(config_t, htsp_tls_enabled),
+      .get_opts = config_class_htsp_tls_opts,
+      .group  = 9,
+    },
+    {
+      /* no INTEXTRA_RANGE: it cannot express 65535, see the setter */
+      .type   = PT_INT,
+      .id     = "htsp_tls_port",
+      .name   = N_("Encrypted HTSP port (TCP)"),
+      .desc   = N_("TCP port of the encrypted HTSP server (standard "
+                   "port is 9984). Ports below 1024 need the command "
+                   "line option --htsp_tls_port, because Tvheadend "
+                   "usually no longer runs as root when the "
+                   "configuration is applied."),
+      .off    = offsetof(config_t, htsp_tls_port),
+      .set    = config_class_htsp_tls_port_set,
+      .get_opts = config_class_htsp_tls_opts,
+      .group  = 9,
+    },
+    {
+      .type   = PT_STR,
+      .id     = "htsp_tls_status",
+      .name   = N_("Status"),
+      .desc   = N_("State of the encrypted HTSP port. When it cannot "
+                   "start, the reason is in the log."),
+      .get    = config_class_htsp_tls_status_get,
+      .opts   = PO_RDONLY | PO_NOSAVE,
+      .group  = 9,
+    },
+    {
+      .type   = PT_STR,
+      .id     = "htsp_tls_fingerprint",
+      .name   = N_("Certificate fingerprint (SHA-256)"),
+      .desc   = N_("Fingerprint of the certificate used by the encrypted "
+                   "HTSP port. Compare it with the fingerprint a client "
+                   "shows on the first connection. Empty while the "
+                   "encrypted HTSP port is disabled."),
+      .get    = config_class_htsp_tls_fingerprint_get,
+      /* multiline: the 95 characters do not fit a one-line field */
+      .opts   = PO_RDONLY | PO_NOSAVE | PO_MULTILINE,
+      .group  = 9,
+    },
+    {
+      .type   = PT_STR,
+      .id     = "htsp_tls_cert",
+      .name   = N_("Certificate file"),
+      .desc   = N_("Path to the PEM certificate (with the intermediate "
+                   "certificates, if any) for the encrypted HTSP port. "
+                   "Leave empty to use a self-signed certificate that "
+                   "Tvheadend generates in the configuration directory. "
+                   "A changed file is loaded for the next connection, "
+                   "so a renewed certificate does not need a restart."),
+      .off    = offsetof(config_t, htsp_tls_cert),
+      .opts   = PO_EXPERT,
+      .group  = 9,
+    },
+    {
+      .type   = PT_STR,
+      .id     = "htsp_tls_key",
+      .name   = N_("Private key file"),
+      .desc   = N_("Path to the PEM private key of the certificate. Leave "
+                   "empty when the key is stored in the certificate "
+                   "file. The file must be readable by the Tvheadend "
+                   "user only."),
+      .off    = offsetof(config_t, htsp_tls_key),
+      .opts   = PO_EXPERT,
+      .group  = 9,
     },
     {
       .type   = PT_STR,

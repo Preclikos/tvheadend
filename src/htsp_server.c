@@ -43,13 +43,14 @@
 #endif
 
 #include "settings.h"
+#include "tls_server.h"
 #include "epggrab.h"  //Needed to be able to test for epggrab_conf.epgdb_processparentallabels
 
 /* **************************************************************************
  * Datatypes and variables
  * *************************************************************************/
 
-static void *htsp_server, *htsp_server_2;
+static void *htsp_server, *htsp_server_2, *htsp_server_tls;
 
 #define HTSP_PROTO_VERSION 44
 
@@ -119,7 +120,9 @@ typedef struct htsp_msg_q {
 typedef struct htsp_connection {
   LIST_ENTRY(htsp_connection) htsp_link;
 
-  int htsp_fd;
+  int htsp_fd;       /* messages are read and written here */
+  int htsp_sock_fd;  /* the TCP socket (differs from htsp_fd with TLS) */
+  int htsp_tls;
   struct sockaddr_storage *htsp_peer;
 
   uint32_t htsp_version;
@@ -354,7 +357,7 @@ htsp_image(htsp_connection_t *htsp, const char *image,
       socklen_t addrlen;
       char abuf[64];
       addrlen = sizeof(addr);
-      getsockname(htsp->htsp_fd, (struct sockaddr*)&addr, &addrlen);
+      getsockname(htsp->htsp_sock_fd, (struct sockaddr*)&addr, &addrlen);
       tcp_get_url_host_from_ip(&addr, abuf, sizeof(abuf));
       snprintf(buf, buflen, "http://%s:%d%s/imagecache/%d",
                       abuf,
@@ -3351,7 +3354,7 @@ htsp_server_status ( void *opaque, htsmsg_t *m )
   htsp_connection_t *htsp = opaque;
   access_t *aa;
   char buf[128];
-  htsmsg_add_str(m, "type", "HTSP");
+  htsmsg_add_str(m, "type", htsp->htsp_tls ? "HTSPS" : "HTSP");
   if (htsp->htsp_username) {
     aa = htsp->htsp_granted_access;
     if (!strcmp(htsp->htsp_username, aa->aa_username ?: ""))
@@ -3408,7 +3411,7 @@ htsp_read_loop(htsp_connection_t *htsp)
   htsp->htsp_granted_access = access_get_by_addr(htsp->htsp_peer);
   htsp->htsp_granted_access->aa_rights |= ACCESS_HTSP_INTERFACE;
 
-  tcp_id = tcp_connection_launch(htsp->htsp_fd, streaming, htsp_server_status,
+  tcp_id = tcp_connection_launch(htsp->htsp_sock_fd, streaming, htsp_server_status,
                                  htsp->htsp_granted_access);
 
   tvh_mutex_unlock(&global_lock);
@@ -3416,7 +3419,8 @@ htsp_read_loop(htsp_connection_t *htsp)
   if (tcp_id == NULL)
     return 0;
 
-  tvhinfo(LS_HTSP, "Got connection from %s", htsp->htsp_logname);
+  tvhinfo(LS_HTSP, "Got %sconnection from %s",
+          htsp->htsp_tls ? "TLS " : "", htsp->htsp_logname);
 
   /* Session main loop */
 
@@ -3430,7 +3434,7 @@ readmsg:
     tvh_mutex_lock(&global_lock);
     if (htsp_authenticate(htsp, m)) {
       tcp_connection_land(tcp_id);
-      tcp_id = tcp_connection_launch(htsp->htsp_fd, streaming, htsp_server_status,
+      tcp_id = tcp_connection_launch(htsp->htsp_sock_fd, streaming, htsp_server_status,
                                      htsp->htsp_granted_access);
       if (tcp_id == NULL) {
         reply = htsmsg_create_map();
@@ -3466,7 +3470,7 @@ readmsg:
           } else {
             if (!streaming && htsp_method_streams(method, m)) {
               tcp_connection_land(tcp_id);
-              tcp_id = tcp_connection_launch(htsp->htsp_fd, 1, htsp_server_status,
+              tcp_id = tcp_connection_launch(htsp->htsp_sock_fd, 1, htsp_server_status,
                                              htsp->htsp_granted_access);
               if (tcp_id == NULL) {
                 reply = htsmsg_create_map();
@@ -3575,8 +3579,8 @@ htsp_write_scheduler(void *aux)
  *
  */
 static void
-htsp_serve(int fd, void **opaque, struct sockaddr_storage *source,
-	   struct sockaddr_storage *self)
+htsp_serve_connection(int fd, int sock_fd, int tls, void **opaque,
+                      struct sockaddr_storage *source)
 {
   htsp_connection_t htsp;
   char buf[50];
@@ -3585,7 +3589,7 @@ htsp_serve(int fd, void **opaque, struct sockaddr_storage *source,
   // Note: global_lock held on entry
 
   if (config.dscp >= 0)
-    socket_set_dscp(fd, config.dscp, NULL, 0);
+    socket_set_dscp(sock_fd, config.dscp, NULL, 0);
 
   tcp_get_str_from_ip(source, buf, 50);
 
@@ -3602,6 +3606,8 @@ htsp_serve(int fd, void **opaque, struct sockaddr_storage *source,
   htsp_update_logname(&htsp);
 
   htsp.htsp_fd = fd;
+  htsp.htsp_sock_fd = sock_fd;
+  htsp.htsp_tls = tls;
   htsp.htsp_peer = source;
   htsp.htsp_writer_run = 1;
 
@@ -3681,6 +3687,53 @@ htsp_serve(int fd, void **opaque, struct sockaddr_storage *source,
   *opaque = NULL;
 }
 
+/**
+ * Plain HTSP connection
+ */
+static void
+htsp_serve(int fd, void **opaque, struct sockaddr_storage *source,
+	   struct sockaddr_storage *self)
+{
+  htsp_serve_connection(fd, fd, 0, opaque, source);
+}
+
+/**
+ * Encrypted HTSP connection: the TLS layer hands over a plain
+ * descriptor, the HTSP code is the same as for the plain port.
+ */
+static void
+htsp_tls_serve(int fd, void **opaque, struct sockaddr_storage *source,
+               struct sockaddr_storage *self)
+{
+  tls_conn_t *tc;
+  char peer[50];
+  char *cert, *key;
+  int afd;
+
+  // Note: global_lock held on entry
+
+  tcp_get_str_from_ip(source, peer, sizeof(peer));
+  cert = config.htsp_tls_cert ? strdup(config.htsp_tls_cert) : NULL;
+  key  = config.htsp_tls_key ? strdup(config.htsp_tls_key) : NULL;
+  tvh_mutex_unlock(&global_lock);
+
+  /* pick up a changed or renewed certificate */
+  tls_server_check(cert, key);
+  free(cert);
+  free(key);
+
+  afd = tls_server_accept(fd, peer, &tc);
+
+  tvh_mutex_lock(&global_lock);
+  if (afd >= 0) {
+    htsp_serve_connection(afd, fd, 1, opaque, source);
+    tvh_mutex_unlock(&global_lock);
+    tls_conn_destroy(tc);
+    tvh_mutex_lock(&global_lock);
+  }
+  close(fd);
+}
+
 /*
  * Cancel callback
  */
@@ -3693,6 +3746,135 @@ htsp_server_cancel ( void *opaque )
     shutdown(htsp->htsp_fd, SHUT_RDWR);
 }
 
+static tcp_server_ops_t htsp_ops = {
+  .start  = htsp_serve,
+  .stop   = NULL,
+  .cancel = htsp_server_cancel
+};
+
+static tcp_server_ops_t htsp_tls_ops = {
+  .start  = htsp_tls_serve,
+  .stop   = NULL,
+  .cancel = htsp_server_cancel
+};
+
+/*
+ * Encrypted HTSP port
+ *
+ * The port is set either by the command line option --htsp_tls_port,
+ * bound in htsp_init() before the privileges are dropped, or in the
+ * configuration, opened (and moved or closed on change) once the
+ * configuration is loaded.
+ */
+extern int tvheadend_htsp_tls_port;
+
+enum {
+  HTSP_TLS_OK,
+  HTSP_TLS_ERR_CERT,
+  HTSP_TLS_ERR_PORT,
+};
+
+static char *htsp_bindaddr;
+static int   htsp_registered;
+static int   htsp_tls_bound_port;   /* port of htsp_server_tls */
+static int   htsp_tls_error;
+
+int
+htsp_tls_port_locked(void)
+{
+  return tvheadend_htsp_tls_port > 0;
+}
+
+static int
+htsp_tls_wanted_port(void)
+{
+  if (htsp_tls_port_locked())
+    return tvheadend_htsp_tls_port;
+  return config.htsp_tls_enabled ? config.htsp_tls_port : 0;
+}
+
+static void
+htsp_tls_close(void)
+{
+  if (htsp_server_tls == NULL)
+    return;
+  tcp_server_delete(htsp_server_tls);
+  htsp_server_tls = NULL;
+  tvhinfo(LS_HTSP, "HTSP TLS server on port %d stopped", htsp_tls_bound_port);
+  htsp_tls_bound_port = 0;
+}
+
+/*
+ * Bring the listener in line with the wanted port. Running sessions are
+ * not affected when the port is closed or moved.
+ */
+void
+htsp_tls_reconfigure(void)
+{
+  int port;
+
+  lock_assert(&global_lock);
+
+  if (!htsp_registered)
+    return;
+
+  port = htsp_tls_wanted_port();
+  if (htsp_server_tls && port == htsp_tls_bound_port)
+    return;
+
+  htsp_tls_close();
+  htsp_tls_error = HTSP_TLS_OK;
+  if (port <= 0)
+    return;
+
+  if (tls_server_init(config.htsp_tls_cert, config.htsp_tls_key)) {
+    tvherror(LS_HTSP, "no usable certificate, the HTSP TLS server is not started");
+    htsp_tls_error = HTSP_TLS_ERR_CERT;
+    return;
+  }
+  htsp_server_tls = tcp_server_create(LS_HTSP, "HTSP TLS", htsp_bindaddr,
+                                      port, &htsp_tls_ops, NULL);
+  if (htsp_server_tls == NULL) {
+    htsp_tls_error = HTSP_TLS_ERR_PORT;
+    return;
+  }
+  tcp_server_register(htsp_server_tls);
+  htsp_tls_bound_port = port;
+}
+
+void
+htsp_tls_status(char *dst, size_t dstsize)
+{
+  int port;
+
+  lock_assert(&global_lock);
+
+  port = htsp_tls_wanted_port();
+  if (htsp_server_tls)
+    snprintf(dst, dstsize, "Listening on TCP port %d%s", htsp_tls_bound_port,
+             htsp_tls_port_locked() ? " (command line option --htsp_tls_port)" : "");
+  else if (port <= 0)
+    snprintf(dst, dstsize, "Disabled");
+  else if (htsp_tls_error == HTSP_TLS_ERR_CERT)
+    snprintf(dst, dstsize, "Not started: no usable certificate (see the log)");
+  else
+    snprintf(dst, dstsize, "Not started: TCP port %d cannot be opened (see the log)", port);
+}
+
+void
+htsp_tls_fingerprint(char *dst, size_t dstsize)
+{
+  lock_assert(&global_lock);
+
+  if (htsp_server_tls == NULL) {
+    if (dstsize)
+      *dst = '\0';
+    return;
+  }
+  tls_server_check(config.htsp_tls_cert, config.htsp_tls_key);
+  tls_server_fingerprint(dst, dstsize);
+}
+
 /**
  *  Fire up HTSP server
  */
@@ -3700,15 +3882,17 @@ void
 htsp_init(const char *bindaddr)
 {
   extern int tvheadend_htsp_port_extra;
-  static tcp_server_ops_t ops = {
-    .start  = htsp_serve,
-    .stop   = NULL,
-    .cancel = htsp_server_cancel
-  };
+
+  htsp_bindaddr = bindaddr ? strdup(bindaddr) : NULL;
   if (tvheadend_htsp_port > 0)
-    htsp_server = tcp_server_create(LS_HTSP, "HTSP", bindaddr, tvheadend_htsp_port, &ops, NULL);
+    htsp_server = tcp_server_create(LS_HTSP, "HTSP", bindaddr, tvheadend_htsp_port, &htsp_ops, NULL);
   if (tvheadend_htsp_port_extra > 0)
-    htsp_server_2 = tcp_server_create(LS_HTSP, "HTSP2", bindaddr, tvheadend_htsp_port_extra, &ops, NULL);
+    htsp_server_2 = tcp_server_create(LS_HTSP, "HTSP2", bindaddr, tvheadend_htsp_port_extra, &htsp_ops, NULL);
+  if (htsp_tls_port_locked()) {
+    htsp_server_tls = tcp_server_create(LS_HTSP, "HTSP TLS", bindaddr, tvheadend_htsp_tls_port, &htsp_tls_ops, NULL);
+    if (htsp_server_tls)
+      htsp_tls_bound_port = tvheadend_htsp_tls_port;
+  }
 }
 
 /*
@@ -3717,10 +3901,25 @@ htsp_init(const char *bindaddr)
 void
 htsp_register(void)
 {
+  lock_assert(&global_lock);
+
   if (htsp_server)
     tcp_server_register(htsp_server);
   if (htsp_server_2)
     tcp_server_register(htsp_server_2);
+  htsp_registered = 1;
+  if (htsp_server_tls) {
+    /* the certificate needs the configuration, loaded after htsp_init() */
+    if (tls_server_init(config.htsp_tls_cert, config.htsp_tls_key)) {
+      tvherror(LS_HTSP, "no usable certificate, the HTSP TLS server is not started");
+      htsp_tls_close();
+      htsp_tls_error = HTSP_TLS_ERR_CERT;
+    } else {
+      tcp_server_register(htsp_server_tls);
+    }
+  } else {
+    htsp_tls_reconfigure();
+  }
 }
 
 /**
@@ -3730,11 +3929,20 @@ void
 htsp_done(void)
 {
   tvh_mutex_lock(&global_lock);
+  htsp_registered = 0;
   if (htsp_server_2)
     tcp_server_delete(htsp_server_2);
   if (htsp_server)
     tcp_server_delete(htsp_server);
+  if (htsp_server_tls)
+    tcp_server_delete(htsp_server_tls);
+  htsp_server = htsp_server_2 = htsp_server_tls = NULL;
+  htsp_tls_bound_port = 0;
+  free(htsp_bindaddr);
+  htsp_bindaddr = NULL;
   tvh_mutex_unlock(&global_lock);
+  /* sessions still running keep their own reference to the context */
+  tls_server_done();
 }
 
 /* **************************************************************************
